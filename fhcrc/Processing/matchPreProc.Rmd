@@ -1,0 +1,199 @@
+---
+title: "matchPreProc"
+output: html_document
+---
+
+One major problem that occurs in many different tasks is how to reconcile two noisy character based data sets. There are many tools in existence that help facilitate this, but common to all of them is the need to eliminate known sources of noise quickly.
+
+This code preprocesses data prior to use of a series of matching algorithms using string distance and substring operations. It largely achieves this through use of ```grep```, vectorized operations, and parallel operations (i.e. ```sapply```).
+
+An area of optimization yet to occur is the use of distributed processing. With a small enough data set, almost all of the expensive operations could be made across many cores, i.e. using ```paralllel::mcLapply``` or ```parallel::parLapply```. 
+
+Here, the dependencies, environmental variables, and user defined functions are described.
+```{r content1, eval=F}
+library(RODBC); library(Rcpp);
+
+## Define dir for BLOB xor SQL export
+BinaryPath <- FALSE
+SqlTable <- FALSE
+
+## Input for reading in data treatment objects
+InputPath <- "//tax/"
+
+## UDFs ##
+
+# Remove leading spaces
+trim <- function (x) gsub("^\\s+|\\s+$", "", x)
+
+# Given `input' list of space split strings, 
+# remove `vector' from all, paste together.
+vectorErase <- function(input, vector) {
+	subString <- paste0("\\s+",vector,"\\s+", collapse="|")  
+	return( 
+		paste0(gsub(subString, " ", input, perl=T, ignore.case = T)) 
+	)
+}
+
+# Retrieve all obs of `vars' from SQL table
+GetAllTax <- function(MatchSetChannel,vars) {
+	return(
+		sqlQuery(MatchSetChannel, 
+						 paste0(
+						 	"select ",vars," from TaxData "
+						 )              
+						 ,stringsAsFactors=F)
+	)
+}
+
+## Compiles, loads appendRcpp()
+# Use to preallocate matrix
+# Speeds up assign for ragged arrays
+# sourceCpp(paste0(InputPath, "cppHelpers.cpp"))
+# Deprecated, use if string splitting
+```
+
+
+String split was used previously to analyze and prepare dataset. However, we deemed activity too complicated relative to simple ```grep```. I scripted a function called ```appendRcpp``` if we ever needed to manipulate quantitative data, and wanted to make sure R knew how much memory to apportion for the object.
+```{r engine='Rcpp', eval=F}
+#include <Rcpp.h>
+using namespace Rcpp ;
+
+// [[Rcpp::export]]
+void appendRcpp(  List fillVecs, NumericVector newLengths, NumericMatrix retmat, NumericVector retmatLengths ) {
+  /* appendRcpp
+	Fills numeric matrix
+	Loop through rows, filling retmat in with the vectors in list
+	then update return matrix size to index the next free
+	*/
+	
+	// Declare vars
+	NumericVector fillTmp;
+	int sizeOld, sizeNew;
+    
+	// Pull out dimensions of return matrix to fill
+	int nrow = retmat.nrow();
+  int ncol = retmat.ncol();
+    
+	// Check that dimensions match
+	if ( nrow != retmatLengths.size() || nrow != fillVecs.size() ) { 
+        throw std::range_error("In appendC(): dimension mismatch");
+    }
+    
+	// Traverse ddimensions
+	for (int ii=0; ii<ncol; ii++) {
+        throw std::range_error("In appendC(): exceeded max cols");
+		
+	// Iterator for row to fill
+        NumericMatrix::Row retRow = retmat(ii, _);
+	
+  // Fill row of return matrix, starting at first non-zero element
+        std::copy( fillTmp.begin(), fillTmp.end(), retRow.begin() + sizeOld );
+  
+  // Update size of return matrix
+        retmatLengths[ii] = sizeNew;
+		}
+	}
+```
+
+Here, all of the previously mentioned functions are called. The overall process takes in the contents of a SQL table, cleans and regularizes variables across the dataset, and then saves to either binary large object (i.e. RData file) or SQL write. 
+
+An additional area of optimization is the ```GetAllTax``` function. Currently, it merely feeds a type of ```SELECT *``` operation to the SQLAgent with no major tuning parameters. Revising the query to only use the smallest necessary set could save a great deal of time. Refactoring the code into a stored procedure call with tuned degree of parallelism would also increase efficiency.
+```{r content2, eval=F}
+## OPS ##
+
+
+## Define columns
+ColumnNamesMatchandAppend <- read.csv("/ColumnNamesMatchandAppend.csv")
+ColumnNamesMatchandAppend$X <- NULL
+
+## Data treatment objects
+# For Street Name Suffixes
+StreetNamesandAbbreviationsFinal <- read.csv(paste0(InputPath,"/StreetNamesandAbbreviationsFinal.csv"))
+StreetNamesandAbbreviationsFinal <- as.character(as.array(StreetNamesandAbbreviationsFinal[,1]))
+StreetNamesandAbbreviationsFinal <- toupper(gsub("\\.","\\\\\\.",StreetNamesandAbbreviationsFinal))
+
+# Added to prevent grep compiler crash
+StreetNamesandAbbreviationsFinal <- unique(gsub("\\\\\\.","",StreetNamesandAbbreviationsFinal))
+
+# For Street Name Directionals
+CompassRoseFinal <- read.csv(paste0(InputPath,"/CompassRoseFinal.csv")) 
+CompassRoseFinal <- as.character(as.array(CompassRoseFinal[,1]))
+
+# For Street Number
+StreetNumberPossibilities <- read.csv(paste0(InputPath,"/StreetNumberPossibilities.csv"))
+StreetNumberPossibilities <- as.character(as.array(StreetNumberPossibilities[,1]))
+
+## For City
+TaxDataInformation <- read.csv(paste0(InputPath,"/TaxDataInformation.csv"))
+CityDirections <- c("NORTH","SOUTH","EAST","WEST", "NORTHEAST","NORTHWEST","SOUTHEAST","SOUTHWEST")
+
+
+## Variables for query
+vars <- "[FIPS CODE], [ETC] "
+
+## SQL Connection string to data provider
+MatchSetChannel <- odbcDriverConnect("driver={SQL Server}; etc.")
+
+## Retrieve data
+# Benchmark as needed
+# ptm <- proc.time()
+MatchSet <- GetAllTax(MatchSetChannel,vars)
+# proc.time() - ptm
+
+## Prepare Matchset
+# Use only first 5 of zip code
+# NOTE: Assume each new vector to consume at least 2 GB of RAM to hold in env at peak
+MatchSet$ZipCodeCorrected <- substr(MatchSet$"PROPERTY ZIPCODE",1,5)      
+
+# Use leading 0 for FIPS code
+MatchSet$FIPSCorrected <- formatC(MatchSet$"FIPS CODE",width=5,flag = "0")
+
+# Treatment for Street Num
+# Benchmark: 5-10 minutes per op, 147 million obs
+MatchSet$PropertyHouseNumber1 <- ifelse(is.na(MatchSet$"PROPERTY HOUSE NUMBER PREFIX") | 
+																					MatchSet$"PROPERTY HOUSE NUMBER PREFIX"==0 |
+																					MatchSet$"PROPERTY HOUSE NUMBER PREFIX" == "","",MatchSet$"PROPERTY HOUSE NUMBER PREFIX")
+MatchSet$PropertyHouseNumber2 <- ifelse(is.na(MatchSet$"PROPERTY HOUSE NUMBER") | 
+																					MatchSet$"PROPERTY HOUSE NUMBER"==0 |
+																					MatchSet$"PROPERTY HOUSE NUMBER" == "","",as.integer(MatchSet$"PROPERTY HOUSE NUMBER"))
+MatchSet$PropertyHouseNumber3 <- ifelse(is.na(MatchSet$"PROPERTY HOUSE NUMBER SUFFIX") | 
+																					MatchSet$"PROPERTY HOUSE NUMBER SUFFIX"==0 |
+																					MatchSet$"PROPERTY HOUSE NUMBER SUFFIX"== "","",MatchSet$"PROPERTY HOUSE NUMBER SUFFIX")
+MatchSet$PropertyHouseNumber4 <- ifelse(is.na(MatchSet$"PROPERTY APARTMENT UNIT NUMBER") | 
+																					MatchSet$"PROPERTY APARTMENT UNIT NUMBER"==0 |
+																					MatchSet$"PROPERTY APARTMENT UNIT NUMBER" == "","",MatchSet$"PROPERTY APARTMENT UNIT NUMBER")
+MatchSet$HouseNumberCorrected <- paste0(MatchSet$PropertyHouseNumber1,MatchSet$PropertyHouseNumber2,MatchSet$PropertyHouseNumber3,MatchSet$PropertyHouseNumber4)
+MatchSet$HouseNumberCorrected <- gsub("[[:punct:]]| ", "", toupper(as.character(MatchSet$HouseNumberCorrected)))
+
+# Initial treatment for Street Name Directional
+MatchSet$DirectionCorrected <- ifelse(is.na(MatchSet$"PROPERTY DIRECTION") | MatchSet$"PROPERTY DIRECTION"==0,"",MatchSet$"PROPERTY DIRECTION")
+
+# Initial treatment for City
+MatchSet$CityUpper <- toupper(as.character(MatchSet$"PROPERTY CITY"))
+MatchSet$CityCorrected <- ""
+
+
+# Prepare City using grep function
+MatchSet$CityCorrected <- sapply( MatchSet$"PROPERTY CITY", vectorErase, CityDirections )
+MatchSet$CityCorrected <- trim(gsub("[[:punct:]]| ", "", toupper(as.character(MatchSet$CityCorrected))))
+
+# Prepare Street Name using grep function.
+MatchSet$StreetNameCorrected <- sapply( MatchSet$"PROPERTY STREET NAME", vectorErase, StreetNamesandAbbreviationsFinal )
+MatchSet$StreetNameCorrected <- trim(gsub("[[:punct:]]| ", "", toupper(as.character(MatchSet$StreetNameCorrected))))
+
+
+## Code when we used string split:
+# temp <- str_split(z)
+# output$z <- MatchSet$StreetNameCorrected <- sapply( 1:length(temp), 
+#                                         function(x) vectorErase(temp[[x]], StreetNamesandAbbreviationsFinal) )
+
+
+# Return for binary
+if( BinaryPath & !SqlTable ) save(MatchSet, BinaryPath)
+
+# Return for SQL write
+if( !BinaryPath & SqlTable ) sqlSave(MatchSetChannel, MatchSet, SqlTable)
+
+# Write variable error handling
+if( (BinaryPath & SqlTable) | (!BinaryPath & !SqlTable) cat("Write failed!\n Select either binary or SQL write.")
+```
